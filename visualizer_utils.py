@@ -2177,46 +2177,62 @@ def merge_with_obs_data(conn, main_table, obs_table=None):
     else:
         return conn.execute(f"SELECT * FROM {main_table}").df()
 
-def calculate_statistics_duckdb(conn, table_name, column, scenario=None):
+def calculate_statistics_duckdb(conn, table_name, column, scenario=None, year_range=None):
     """
-    Calculate basic statistics using DuckDB
+    Calculate basic statistics using DuckDB with year filtering
     
     Args:
         conn: DuckDB connection
         table_name: Name of the table
         column: Column to analyze
         scenario: Specific scenario (optional)
+        year_range: Year range filter (optional)
     
     Returns:
         Dictionary of statistics
     """
-    where_clause = f"WHERE Scenario = '{scenario}'" if scenario else ""
+    where_clauses = []
+    
+    if scenario:
+        where_clauses.append(f"Scenario = '{scenario}'")
+    
+    if year_range:
+        where_clauses.append(f"time >= {year_range[0]} AND time <= {year_range[1]}")
+    
+    where_clause = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    
+    # Properly quote column name to handle special characters
+    quoted_column = f'"{column}"'
     
     query = f"""
     SELECT 
-        COUNT({column}) as count,
-        AVG({column}) as mean,
-        STDDEV({column}) as std,
-        MIN({column}) as min,
-        MAX({column}) as max,
-        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {column}) as q25,
-        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {column}) as median,
-        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {column}) as q75
+        COUNT({quoted_column}) as count,
+        AVG({quoted_column}) as mean,
+        STDDEV({quoted_column}) as std,
+        MIN({quoted_column}) as min,
+        MAX({quoted_column}) as max,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {quoted_column}) as q25,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {quoted_column}) as median,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {quoted_column}) as q75
     FROM {table_name}
     {where_clause}
     """
     
-    result = conn.execute(query).fetchone()
-    return {
-        'Count': result[0],
-        'Mean': result[1],
-        'Std': result[2],
-        'Min': result[3],
-        'Max': result[4],
-        'Q25': result[5],
-        'Median': result[6],
-        'Q75': result[7]
-    }
+    try:
+        result = conn.execute(query).fetchone()
+        return {
+            'Count': result[0],
+            'Mean': result[1],
+            'Std': result[2],
+            'Min': result[3],
+            'Max': result[4],
+            'Q25': result[5],
+            'Median': result[6],
+            'Q75': result[7]
+        }
+    except Exception as e:
+        st.error(f"Error calculating statistics for {column}: {str(e)}")
+        return {}
 
 def visualize_scenario_trends_duckdb(conn, table_name, column, year_range, selected_metrics, obs_columns=None, ID_select=None):
     """
@@ -2356,7 +2372,7 @@ def visualize_scenario_trends_duckdb(conn, table_name, column, year_range, selec
                 with st.expander(f"📈 Statistics for Scenario: {scenario}", expanded=False):
                     # Calculate statistics using DuckDB
                     if column and 'basic' in selected_metrics:
-                        stats_results = calculate_statistics_duckdb(conn, table_name, column, scenario)
+                        stats_results = calculate_statistics_duckdb(conn, table_name, column, scenario, year_range)
                         
                         # Display metrics in a more compact way
                         metrics_per_row = 4
@@ -2473,30 +2489,29 @@ def visualize_scenario_trends_duckdb(conn, table_name, column, year_range, selec
 def plot_scenarios_streamlit_duckdb(all_daily_data, dataframes_ao, dataframes_harvest, obs_data=None):
     """
     Main function to plot scenarios using DuckDB for data processing
-    
+
     Args:
         all_daily_data: List of tuples (list_daily_dfs, daily_keys) for each file
         dataframes_ao: List of aggregated output dataframes
         dataframes_harvest: List of harvest dataframes
         obs_data: Observation data (optional)
     """
-    
+
     st.sidebar.header("Plot Scenarios")
-    
+
     # Initialize DuckDB connection
     conn = init_duckdb()
-    
+
     # Create mapping for user-friendly names
     table_mapping = {
         "daily_vars": "Daily vars DataFrame",
         "aggregated_outputs": "Aggregated outputs DataFrame", 
         "harvest_data": "Harvest DataFrame"
     }
-    
+
     # Determine available tables
     available_tables = []
     if all_daily_data:
-        # Check if any daily data has non-empty dataframes
         has_daily_data = any(
             daily_data[0] and len(daily_data[0]) > 0 
             for daily_data in all_daily_data 
@@ -2504,54 +2519,51 @@ def plot_scenarios_streamlit_duckdb(all_daily_data, dataframes_ao, dataframes_ha
         )
         if has_daily_data:
             available_tables.append("daily_vars")
-    
+
     if dataframes_ao:
         available_tables.append("aggregated_outputs")
     if dataframes_harvest:
         available_tables.append("harvest_data")
-    
+
     if not available_tables:
         st.error("No valid DataFrames to display. Please check your inputs.")
         return
-    
-    # Filter available tables and create display options
+
     display_options = {table_mapping.get(table, table): table for table in available_tables}
-    
-    # Let user select table
     selected_display_name = st.sidebar.selectbox("Select DataFrame", list(display_options.keys()))
     selected_table = display_options[selected_display_name]
-    
-    # If daily vars is selected, let user choose keys
+
     selected_keys = None
     if selected_table == "daily_vars":
-        # Get all unique keys from all files
         all_keys = set()
         for daily_data in all_daily_data:
             if daily_data and len(daily_data) == 2:
                 list_daily_dfs, daily_keys = daily_data
                 if daily_keys:
                     all_keys.update(daily_keys)
-        
+
         all_keys = sorted(list(all_keys))
-        
+
         if not all_keys:
             st.error("No daily data keys available.")
             return
-        
+
         st.sidebar.markdown("### 🔑 Select Daily Data Keys")
         selected_keys = st.sidebar.multiselect(
             "Choose which daily data keys to analyze:",
             options=all_keys,
             default=None
         )
-        
+
         if not selected_keys:
             st.info("👆 Please select at least one daily data key to continue.")
             return
-    
-    # Setup DuckDB tables based on selection
+
+    # Required columns
+    required_columns = ['time', 'year', 'dayofyear', 'Scenario']
+
+    # Combine relevant DataFrames based on selection
     if selected_table == "daily_vars":
-        # Only setup daily vars table with selected keys
         dataframes_combine = []
         for daily_data in all_daily_data:
             if daily_data and len(daily_data) == 2:
@@ -2560,52 +2572,68 @@ def plot_scenarios_streamlit_duckdb(all_daily_data, dataframes_ao, dataframes_ha
                     for i, key in enumerate(daily_keys):
                         if key in selected_keys and i < len(list_daily_dfs):
                             df = list_daily_dfs[i].copy()
-                            df['DataKey'] = key  # Add key identifier
+                            df['DataKey'] = key
                             dataframes_combine.append(df)
-        
-        setup_duckdb_tables(conn, dataframes_combine, [], [], obs_data)
+        relevant_dfs = dataframes_combine
+
+    elif selected_table == "aggregated_outputs":
+        relevant_dfs = dataframes_ao
+
+    elif selected_table == "harvest_data":
+        relevant_dfs = dataframes_harvest
+
     else:
-        # Setup other tables
-        if selected_table == "aggregated_outputs":
-            setup_duckdb_tables(conn, [], dataframes_ao, [], obs_data)
-        elif selected_table == "harvest_data":
-            setup_duckdb_tables(conn, [], [], dataframes_harvest, obs_data)
-    
-    # Get year range for filtering
+        relevant_dfs = []
+
+    # Get all available columns from relevant DataFrames
+    all_available_columns = set()
+    for df in relevant_dfs:
+        all_available_columns.update(df.columns)
+
+    all_available_columns = sorted(list(all_available_columns - set(required_columns)))
+
+    # Allow user to select columns to keep
+    st.markdown("### 📌 Select the data columns you want to keep")
+    selected_columns = st.multiselect(
+        "Select columns to keep (in addition to required columns):",
+        options=all_available_columns,
+        default=[]
+    )
+
+    all_column = selected_columns + required_columns
+
+    # Filter DataFrames to keep only selected columns
+    def filter_columns(df, columns_to_keep):
+        return df[[col for col in columns_to_keep if col in df.columns]]
+
+    filtered_dfs = [filter_columns(df, all_column) for df in relevant_dfs]
+
+    # Setup DuckDB tables with filtered data
+    if selected_table == "daily_vars":
+        setup_duckdb_tables(conn, filtered_dfs, [], [], obs_data)
+    elif selected_table == "aggregated_outputs":
+        setup_duckdb_tables(conn, [], filtered_dfs, [], obs_data)
+    elif selected_table == "harvest_data":
+        setup_duckdb_tables(conn, [], [], filtered_dfs, obs_data)
+
+    # Year range slider
     try:
         min_year, max_year = get_year_range_from_table(conn, selected_table)
         year_range = st.sidebar.slider("Year Range", min_year, max_year, (min_year, max_year))
     except:
-        year_range = (2000, 2030)  # Default range
-    
-    # Get filtered data with observation data merged
+        year_range = (2000, 2030)
+
+    # Get filtered data
     if obs_data is not None:
         selected_df = merge_with_obs_data(conn, selected_table, "obs_data")
     else:
         selected_df = filter_data_by_year_range(conn, selected_table, year_range)
-    
-    # Variable selection
-    st.markdown("### 📊 Select Variables to Plot")
-    
-    # Get table columns excluding system columns
-    all_columns = get_table_columns(conn, selected_table)
-    exclude_columns = ['Date', 'time', 'dayofyr', 'days_in_year', 'Scenario']
-    if selected_table == "daily_vars":
-        exclude_columns.append('DataKey')
-    
-    variables = [col for col in all_columns if col not in exclude_columns]
-    
-    selected_vars = st.multiselect("Select variables to analyze:", variables)
-    
-    if not selected_vars:
-        st.info("👆 Please select at least one variable to display the analysis.")
-        return
-    
-    # Show selected keys info for daily vars
+
+    # Show selected keys if daily_vars
     if selected_table == "daily_vars" and selected_keys:
         st.info(f"📊 Analyzing daily data for keys: {', '.join(selected_keys)}")
-    
-    # Metrics selection
+
+    # Select metrics for analysis
     metrics_groups = {'basic': 'Basic Statistics', 'time_series': 'Time Series Metrics'}
     st.sidebar.markdown("### 📈 Statistical Analysis Options")
     selected_metrics = st.sidebar.multiselect(
@@ -2614,15 +2642,12 @@ def plot_scenarios_streamlit_duckdb(all_daily_data, dataframes_ao, dataframes_ha
         default=['basic'],
         format_func=lambda x: metrics_groups[x],
     )
-    
-    # Analysis for each variable
-    for column in selected_vars:
-        # Note: You'll need to implement data_transformation_ui_duckdb for DuckDB
-        # For now, using simplified approach
+
+    # Run analysis for each selected variable
+    for column in selected_columns:
         obs_columns = None
         ID_select = None
-        
-        # Analyze and visualize using DuckDB
+
         visualize_scenario_trends_duckdb(
             conn, 
             table_name=selected_table,
@@ -2632,6 +2657,7 @@ def plot_scenarios_streamlit_duckdb(all_daily_data, dataframes_ao, dataframes_ha
             obs_columns=obs_columns, 
             ID_select=ID_select
         )
+
 
 
 
